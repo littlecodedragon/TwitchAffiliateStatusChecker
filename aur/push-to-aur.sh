@@ -53,7 +53,7 @@ git config user.email "$GIT_USER_EMAIL"
 git add --all
 if git commit -m "Update AUR package from upstream (automated)"; then
   echo "Pushing changes to AUR repo..."
-  git push origin main
+  git push origin master
 else
   echo "No changes to commit."
 fi
