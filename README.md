@@ -24,13 +24,61 @@ Lightweight userscript (Tampermonkey / Violentmonkey) that annotates Twitch with
 
 App Access Tokens require a `client_id` and `client_secret`. Do NOT embed `client_secret` in the userscript. Run the included `token-server.js` locally to perform the client_credentials exchange and expose a local endpoint the userscript can query.
 
-Quick start:
+### Easy Installation (Recommended)
+
+**Option 1: One-Command Setup Script**
+
+Run the setup script to automatically install and configure the server as a systemd service:
+
+```bash
+sudo bash setup.sh
+```
+
+The script will:
+- Prompt for your Twitch Client ID and Secret
+- Install the server to `/opt/twitch-token-server`
+- Create and start a systemd service
+- Enable autostart on boot
+
+**Option 2: AUR Package (Arch Linux)**
+
+Install from the AUR:
+
+```bash
+yay -S twitch-token-server
+# or
+paru -S twitch-token-server
+```
+
+Then configure:
+
+```bash
+sudo twitch-token-server-configure
+```
+
+### Manual Setup
+
+If you prefer to run manually:
 
 ```bash
 export CLIENT_ID=your_client_id
 export CLIENT_SECRET=your_client_secret
 node token-server.js
 ```
+
+### Service Management
+
+After installation with setup script or AUR, manage the service with:
+
+```bash
+sudo systemctl status twitch-token-server   # Check status
+sudo systemctl restart twitch-token-server  # Restart
+sudo journalctl -u twitch-token-server -f   # View logs
+```
+
+To reconfigure, edit `/etc/twitch-token-server.conf` and restart the service.
+
+### Endpoint
 
 By default the userscript requests `http://localhost:4000/twitch-token` and expects JSON like:
 
@@ -41,7 +89,7 @@ By default the userscript requests `http://localhost:4000/twitch-token` and expe
 ## Usage
 
 - Visit Twitch directory/search or a channel page. The script auto-annotates visible previews.
-- If a token is not available the script shows a small banner and will retry the local token endpoint periodically.
+- If a token is not available the script shows an `API ERR` indicator under streams (per-stream labels are shown).
 
 ## Development & debugging
 

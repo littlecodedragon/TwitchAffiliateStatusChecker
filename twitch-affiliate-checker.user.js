@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         Twitch Affiliate Status Checker
-// @namespace    http://tampermonkey.net/
+// @namespace    https://github.com/littlecodedragon//TwitchAffiliateStatusChecker
 // @version      1.0
 // @description  Shows affiliate/partner status on Twitch directory and browse pages
 // @author       You
@@ -11,6 +11,13 @@
 // @connect      api.twitch.tv
 // @connect      localhost
 // @run-at       document-idle
+// @homepageURL  https://github.com/littlecodedragon//TwitchAffiliateStatusChecker
+// @supportURL   https://github.com/littlecodedragon//TwitchAffiliateStatusChecker/issues
+// @updateURL    https://raw.githubusercontent.com/littlecodedragon//TwitchAffiliateStatusChecker/main/twitch-affiliate-checker.user.js
+// @downloadURL  https://raw.githubusercontent.com/littlecodedragon//TwitchAffiliateStatusChecker/main/twitch-affiliate-checker.user.js
+//
+// Replace <your-username> and the branch/path above with the correct GitHub user and branch.
+// Example raw URL: https://raw.githubusercontent.com/beat/affiliate/main/twitch-affiliate-checker.user.js
 // ==/UserScript==
 
 (function() {
@@ -36,26 +43,7 @@
     // Track last location to detect SPA navigation changes
     let lastHref = location.href;
 
-    // Display a small banner in-page for token/server status
-    function showBanner(msg, persistent = false) {
-        try {
-            let el = document.getElementById('tac-token-banner');
-            if (!el) {
-                el = document.createElement('div');
-                el.id = 'tac-token-banner';
-                el.style.cssText = 'position:fixed;top:10px;left:10px;padding:8px 12px;background:rgba(0,0,0,0.8);color:#fff;border-radius:6px;z-index:2147483647;font-size:12px;font-weight:600;pointer-events:none';
-                document.body.appendChild(el);
-            }
-            el.textContent = msg;
-            if (!persistent) {
-                setTimeout(() => {
-                    if (el && el.parentNode) el.parentNode.removeChild(el);
-                }, 6000);
-            }
-        } catch (e) {
-            /* ignore DOM errors */
-        }
-    }
+    // Banner UI removed: users prefer inline per-stream indicators only
 
     // Try to obtain an access token from a local server endpoint if available
     function ensureAccessToken() {
@@ -68,7 +56,7 @@
                 onload: function(resp) {
                     try {
                         const body = JSON.parse(resp.responseText);
-                        if (body && body.access_token) {
+                            if (body && body.access_token) {
                             OAUTH_TOKEN = body.access_token;
                             console.log('Twitch Affiliate: obtained access token from local server');
                             invalidToken = false;
@@ -79,23 +67,19 @@
                                 removeAllBadges();
                                 // re-run processing (cards + channel page)
                                 setTimeout(() => { processAllCards(); processChannelPage(); }, 200);
-                            showBanner('Twitch Affiliate: token obtained from local server', false);
-                            resolve(OAUTH_TOKEN);
+                                resolve(OAUTH_TOKEN);
                         } else {
-                            console.warn('Twitch Affiliate: local token endpoint returned no access_token');
-                            showBanner('Twitch Affiliate: local token endpoint returned no access_token', false);
-                            resolve(null);
+                                console.warn('Twitch Affiliate: local token endpoint returned no access_token');
+                                resolve(null);
                         }
                     } catch (e) {
-                        console.error('Twitch Affiliate: failed to parse local token response', e);
-                        showBanner('Twitch Affiliate: failed to parse local token response', false);
-                        resolve(null);
+                            console.error('Twitch Affiliate: failed to parse local token response', e);
+                            resolve(null);
                     }
                 },
                 onerror: function(err) {
-                    // likely server not running
-                    showBanner('Twitch Affiliate: local token server not reachable', false);
-                    resolve(null);
+                        // likely server not running
+                        resolve(null);
                 }
             });
         });
@@ -171,7 +155,7 @@
                         console.error('Twitch API error for', username, err, response.responseText);
                         if (status === 401) {
                             invalidToken = true;
-                            showBanner('Twitch Affiliate: invalid or missing OAuth token', true);
+                            console.warn('Twitch Affiliate: invalid or missing OAuth token');
                         }
                         const result = { broadcasterType: '', error: err };
                         channelCache.set(username, result);
@@ -193,10 +177,7 @@
                 return resolve(result);
             }
 
-            // If we still don't have a token, show banner but attempt request anyway (Twitch will respond accordingly)
-            if (!OAUTH_TOKEN) {
-                showBanner('Twitch Affiliate: no access token — run token server or set OAUTH_TOKEN', true);
-            }
+            // If we still don't have a token, just attempt the request (Twitch will respond accordingly)
 
             sendRequest(false);
         });
