@@ -1,4 +1,5 @@
-# Maintainer: Your Name <your.email@example.com>
+# Maintainer: Beat <beat at example dot com>
+# Contributor: Original submitter <original at example dot com>
 pkgname=twitch-token-server
 pkgver=1.0.0
 pkgrel=1

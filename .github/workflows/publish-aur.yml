@@ -1,0 +1,28 @@
+name: Publish to AUR
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Start SSH agent
+        uses: webfactory/ssh-agent@v0.8.1
+        with:
+          ssh-private-key: ${{ secrets.AUR_DEPLOY_KEY }}
+
+      - name: Push to AUR
+        env:
+          GITHUB_SHA: ${{ github.sha }}
+        run: |
+          chmod +x aur/push-to-aur.sh
+          ./aur/push-to-aur.sh "${{ secrets.AUR_REPO }}"
+
+# Required secrets:
+# - AUR_DEPLOY_KEY: SSH private key with push access to your AUR package repo
+# - AUR_REPO: Full SSH URL of your AUR package repository (e.g. ssh://aur@aur.archlinux.org/twitch-token-server.git)
