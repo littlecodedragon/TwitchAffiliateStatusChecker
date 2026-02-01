@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Twitch Affiliate Status Checker
 // @namespace    https://github.com/littlecodedragon//TwitchAffiliateStatusChecker
-// @version      1.0
+// @version      1.1
 // @description  Shows affiliate/partner status on Twitch directory and browse pages
 // @author       You
 // @match        https://www.twitch.tv/directory/*
@@ -20,6 +20,9 @@
 // Example raw URL: https://raw.githubusercontent.com/beat/affiliate/main/twitch-affiliate-checker.user.js
 // ==/UserScript==
 
+// Early bootstrap log to verify the script actually runs (visible even before DOM ready)
+console.warn('TAC: bootstrap loaded', new Date().toISOString());
+
 (function() {
     'use strict';
 
@@ -29,11 +32,21 @@
     let OAUTH_TOKEN = ''; // will be fetched from local token server or set manually
     const LOCAL_TOKEN_URL = 'http://localhost:4000/twitch-token';
 
-    const checkedChannels = new Set();
+    // Track which channel pages already have inline labels
+    const processedPages = new Set();
     const channelCache = new Map();
     const pageObservers = new Map();
     let invalidToken = false; // set to true when API returns 401 to prevent repeated requests
     const DEBUG = false; // set false for release; true enables debug logs
+    // If you want extra selector-specific debugging output set this to true
+    const SELECTOR_DEBUG = false;
+
+    // Lightweight debug helper (warn so it stays visible even with default filters)
+    function dbg(...args) {
+        if (SELECTOR_DEBUG) {
+            try { console.warn('TAC:', ...args); } catch (e) {}
+        }
+    }
     
     let lastTokenAttempt = 0;
     const TOKEN_RETRY_MS = 10000;
@@ -62,7 +75,7 @@
                             invalidToken = false;
                             // reset caches so we re-query with the new token
                                 channelCache.clear();
-                                checkedChannels.clear();
+                                processedPages.clear();
                                 // remove any old badges that were created before we had a token
                                 removeAllBadges();
                                 // re-run processing (cards + channel page)
@@ -130,7 +143,7 @@
                             } catch (e) {
                                 console.error('Error parsing Twitch API response for', username, e);
                                 const result = { broadcasterType: '', error: 'parse_error' };
-                                channelCache.set(username, result);
+                                // do not cache parse errors; allow retry
                                 return resolve(result);
                             }
                         }
@@ -157,15 +170,13 @@
                             invalidToken = true;
                             console.warn('Twitch Affiliate: invalid or missing OAuth token');
                         }
-                        const result = { broadcasterType: '', error: err };
-                        channelCache.set(username, result);
-                        return resolve(result);
+                        // do not cache failing responses so we can retry after token/limits clear
+                        return resolve({ broadcasterType: '', error: err });
                     },
                     onerror: function(error) {
                         console.error('API request failed for', username, error);
-                        const result = { broadcasterType: '', error: 'network_error' };
-                        channelCache.set(username, result);
-                        return resolve(result);
+                        // do not cache network failures
+                        return resolve({ broadcasterType: '', error: 'network_error' });
                     }
                 });
             };
@@ -173,7 +184,6 @@
             // If rate-limited, avoid making requests
             if (Date.now() < rateLimitUntil) {
                 const result = { broadcasterType: '', error: 'rate_limited' };
-                channelCache.set(username, result);
                 return resolve(result);
             }
 
@@ -185,12 +195,17 @@
 
     // Extract username from channel card by scanning anchors for a simple /username href
     function extractUsername(element) {
-        const anchors = element.querySelectorAll('a[href^="/"]');
+        // try a variety of anchor patterns: absolute, site-root, and embedded links
+        const anchors = element.querySelectorAll('a[href^="/"], a[href*="twitch.tv/"]');
         for (const a of anchors) {
-            const href = a.getAttribute('href');
+            let href = a.getAttribute('href');
             if (!href) continue;
-            // Match /username optionally followed by ? or # or end
-            const match = href.match(/^\/([a-zA-Z0-9_]+)(?:$|[?#\/])/);
+            // Normalize full URLs to path part
+            let match = href.match(/^https?:\/\/(?:www\.)?twitch\.tv\/([^\/?#]+)/i);
+            if (!match) {
+                // Match /username optionally followed by ? or # or end
+                match = href.match(/^\/([a-zA-Z0-9_]+)(?:$|[?#\/])/);
+            }
             if (match && match[1]) {
                 const name = match[1];
                 const skip = ['directory', 'search', 'videos', 'collections', 'subscriptions', 'settings'];
@@ -199,14 +214,41 @@
                 }
             }
         }
+
+        // Some Twitch markup puts identifying info in aria-labels or image alts — try those as a fallback.
+        try {
+            // aria-labels sometimes contain the channel display name; pick a trailing username-like token
+            const ariaEls = element.querySelectorAll('[aria-label]');
+            for (const el of ariaEls) {
+                const al = (el.getAttribute('aria-label') || '').trim();
+                const m = al.match(/([a-zA-Z0-9_]{3,})$/);
+                if (m && m[1]) return m[1];
+            }
+
+            // image alt attributes sometimes have the username/display name
+            const imgs = element.querySelectorAll('img[alt]');
+            for (const img of imgs) {
+                const alt = (img.getAttribute('alt') || '').trim();
+                const m = alt.match(/^([a-zA-Z0-9_]{3,})/);
+                if (m && m[1]) return m[1];
+            }
+        } catch (e) {
+            /* ignore DOM inspection errors */
+        }
+        if (SELECTOR_DEBUG) {
+            try {
+                const hrefs = Array.from(anchors).slice(0,8).map(a => a.getAttribute('href')).join(', ');
+                console.warn('TAC: extractUsername could not find username for element ->', elementSummary(element), 'anchors:', hrefs);
+            } catch (e) { /* ignore */ }
+        }
         return null;
     }
 
     // Create status badge (smaller, non-intrusive)
-    function createBadge(broadcasterType, error) {
+    function createBadge(broadcasterType, error, variant = 'card') {
         const badge = document.createElement('div');
         badge.className = 'tac-affiliate-badge';
-        badge.style.cssText = [
+        const base = [
             'position: absolute',
             'bottom: 6px',
             'left: 6px',
@@ -219,7 +261,15 @@
             'text-shadow: 0 1px 1px rgba(0,0,0,0.6)',
             'pointer-events: none',
             'box-shadow: 0 2px 6px rgba(0,0,0,0.35)'
-        ].join(';');
+        ];
+        if (variant === 'side') {
+            base[1] = 'bottom: 2px';
+            base[2] = 'left: 2px';
+            base[3] = 'padding: 2px 6px';
+            base[4] = 'border-radius: 10px';
+            base[5] = 'font-size: 11px';
+        }
+        badge.style.cssText = base.join(';');
 
         if (error) {
             badge.textContent = 'API ERR';
@@ -309,8 +359,12 @@
     // Remove all existing badges so they can be refreshed (used after obtaining new token)
     function removeAllBadges() {
         try {
-            const existing = document.querySelectorAll('.tac-affiliate-badge');
-            existing.forEach(el => {
+            const existingBadges = document.querySelectorAll('.tac-affiliate-badge');
+            existingBadges.forEach(el => {
+                if (el && el.parentNode) el.parentNode.removeChild(el);
+            });
+            const inlineLabels = document.querySelectorAll('.tac-inline-label');
+            inlineLabels.forEach(el => {
                 if (el && el.parentNode) el.parentNode.removeChild(el);
             });
         } catch (e) {
@@ -319,10 +373,10 @@
     }
 
     // Create a small inline label to append to overlay text (uses less space)
-    function createInlineLabel(broadcasterType, error) {
+    function createInlineLabel(broadcasterType, error, variant = 'normal') {
         const span = document.createElement('span');
         span.className = 'tac-inline-label';
-        span.style.cssText = [
+        const base = [
             'margin-left:6px',
             'padding:2px 6px',
             'border-radius:999px',
@@ -332,7 +386,13 @@
             'color:#fff',
             'pointer-events:none',
             'box-shadow:0 1px 3px rgba(0,0,0,0.35)'
-        ].join(';');
+        ];
+        if (variant === 'compact') {
+            base[1] = 'padding:1px 5px';
+            base[3] = 'font-size:11px';
+            base.push('line-height:1.2');
+        }
+        span.style.cssText = base.join(';');
 
         if (error) {
             span.textContent = '(API ERR)';
@@ -387,6 +447,24 @@
         return null;
     }
 
+    // Find the best text element inside a sidebar/list row to attach a compact label
+    function findSideNavTextElement(container) {
+        if (!container) return null;
+        const selectors = [
+            '[data-a-target="side-nav-card-title"]',
+            '[data-a-target*="side-nav-title"]',
+            '.side-nav-card__title',
+            '.side-nav-card__title p',
+            '.Layout-sc-1xcs6mc-0 span',
+            'p, span'
+        ];
+        for (const sel of selectors) {
+            const el = container.querySelector(sel);
+            if (el && (el.textContent || '').trim().length > 0) return el;
+        }
+        return null;
+    }
+
     // Helper to produce a short diagnostic summary for an element
     function elementSummary(el) {
         if (!el) return 'null';
@@ -402,16 +480,23 @@
         }
     }
 
+    // Simple logger for sidebar diagnostics
+    function logSideNav(reason, row, extra = '') {
+        if (!SELECTOR_DEBUG) return;
+        try {
+            console.warn('TAC side-nav:', reason, '-', elementSummary(row), extra);
+        } catch (e) { /* ignore */ }
+    }
+
     // Process channel card
     async function processChannelCard(card) {
         try {
             if (!card) return;
             const username = extractUsername(card);
-            if (!username || checkedChannels.has(username)) {
+            if (!username) {
+                if (SELECTOR_DEBUG) console.log('TAC: no username extracted for card ->', elementSummary(card));
                 return;
             }
-
-            checkedChannels.add(username);
 
             // Prefer the preview image/link container so badges don't overlap title/game overlays
             let previewContainer = card.querySelector('a[data-a-target="preview-card-image-link"]') ||
@@ -489,23 +574,121 @@
         }
     }
 
+    // Process side navigation or compact list rows
+    async function processSideNavItem(row) {
+        try {
+            if (!row) return;
+            const isSideNav = row.closest('nav#side-nav') || row.closest('[data-test-selector*="side-nav"]') || String(row.className || '').includes('side-nav');
+            if (!isSideNav) return;
+            logSideNav('start', row);
+
+            const username = extractUsername(row);
+            if (!username) {
+                logSideNav('no-username', row);
+                return;
+            }
+
+            const result = await getBroadcasterInfo(username);
+            const broadcasterType = result && result.broadcasterType;
+            const error = result && result.error;
+
+            // Only badge on avatar (sidebar thumbnail); no inline labels
+            const avatar = row.querySelector('.side-nav-card__avatar, .tw-avatar, img.tw-image-avatar, figure img, img');
+            const badgeParent = avatar ? (avatar.closest('.side-nav-card__avatar') || avatar.parentElement) : null;
+            if (badgeParent) {
+                const badgeHost = badgeParent;
+                const computed = window.getComputedStyle(badgeHost);
+                if (computed.position === 'static') {
+                    badgeHost.style.position = 'relative';
+                }
+                badgeHost.style.overflow = 'visible';
+                if (!badgeHost.querySelector('.tac-affiliate-badge')) {
+                    const badge = createBadge(broadcasterType, error, 'side');
+                    adjustBadgePlacement(badgeHost, badge);
+                    badgeHost.appendChild(badge);
+                }
+            }
+        } catch (e) {
+            console.error('processSideNavItem error', e);
+        }
+    }
+
+    // Dedicated scan for sidebar cards (FFZ/7TV sometimes rerender them outside main selectors)
+    function processSideNav() {
+        try {
+            const nav = document.querySelector('nav#side-nav');
+            if (!nav) return;
+            const rows = nav.querySelectorAll('.side-nav-card, a.side-nav-card__link');
+            dbg('side-nav scan rows', rows.length);
+            rows.forEach(r => processSideNavItem(r));
+        } catch (e) {
+            console.error('processSideNav scan error', e);
+        }
+    }
+
+    // Process directory/browse cards by badging the avatar only
+    function processDirectoryCards() {
+        try {
+            // Target avatar links/images on directory cards
+            const avatarLinks = document.querySelectorAll(
+                'a.preview-card-avatar, [data-test-selector=\"preview-card-avatar\"], .preview-card-avatar'
+            );
+            avatarLinks.forEach(link => {
+                const card = link.closest('article') || link;
+                processChannelCard(card);
+            });
+        } catch (e) {
+            console.error('processDirectoryCards error', e);
+        }
+    }
+
+    // Badge the main channel header avatar (for channel pages)
+    async function processChannelHeaderAvatar() {
+        try {
+            const username = getPageUsername();
+            if (!username) return;
+
+            // Locate the channel header avatar image/container
+            const avatarImg = document.querySelector(
+                '.channel-root__player-container img.tw-image-avatar,\
+                 header img.tw-image-avatar,\
+                 [data-a-target="home-channel-header"] img.tw-image-avatar,\
+                 .ScAvatar-sc-144b42z-0 img.tw-image-avatar'
+            ) || document.querySelector('img.tw-image-avatar');
+
+            if (!avatarImg) return;
+
+            const badgeHost = avatarImg.closest('.tw-avatar') || avatarImg.parentElement;
+            if (!badgeHost) return;
+
+            const result = await getBroadcasterInfo(username);
+            const broadcasterType = result && result.broadcasterType;
+            const error = result && result.error;
+
+            const computed = window.getComputedStyle(badgeHost);
+            if (computed.position === 'static') {
+                badgeHost.style.position = 'relative';
+            }
+            badgeHost.style.overflow = 'visible';
+
+            if (!badgeHost.querySelector('.tac-affiliate-badge')) {
+                const badge = createBadge(broadcasterType, error, 'side');
+                adjustBadgePlacement(badgeHost, badge);
+                badgeHost.appendChild(badge);
+            }
+        } catch (e) {
+            console.error('processChannelHeaderAvatar error', e);
+        }
+    }
+
     // Find and process all channel cards
     function processAllCards() {
-        // Twitch uses various selectors for channel cards
-        const selectors = [
-            'article[data-target]',
-            'div[data-target*="directory-card"]',
-            'a[data-a-target="preview-card-image-link"]',
-            'div[class*="StreamPreview"]'
-        ];
-
-        selectors.forEach(selector => {
-            const cards = document.querySelectorAll(selector);
-            cards.forEach(card => {
-                const parent = card.closest('article') || card.closest('div[class*="card"]') || card;
-                processChannelCard(parent);
-            });
-        });
+        // Keep processing focused on sidebar avatars (always visible, even when collapsed)
+        processSideNav();
+        // Also badge the main channel header avatar when on a channel page
+        processChannelHeaderAvatar();
+        // Badge avatars on directory/browse cards
+        processDirectoryCards();
     }
 
     // Get username from page path (first segment)
@@ -524,7 +707,7 @@
             const username = getPageUsername();
             if (!username) return;
             // avoid repeating for same username
-            if (checkedChannels.has('__page__' + username)) return;
+            if (processedPages.has(username)) return;
 
             const titleSelector = 'h1.CoreText-sc-1txzju1-0';
             let titleEl = document.querySelector(titleSelector);
@@ -563,17 +746,17 @@
                                     if (ob) ob.disconnect();
                                 } catch (e) {}
                                 pageObservers.delete(username);
-                                checkedChannels.add('__page__' + username);
+                                processedPages.add(username);
                             }, 30000);
                         } catch (e) {
                             // if observer fails, mark as done so we don't loop forever
-                            checkedChannels.add('__page__' + username);
+                            processedPages.add(username);
                         }
                     }
                 } catch (e) {
                     console.error('processChannelPage append error', e);
                     // mark as done even on error to avoid spamming
-                    checkedChannels.add('__page__' + username);
+                    processedPages.add(username);
                 }
             };
 
@@ -604,13 +787,13 @@
                                 document.documentElement.removeAttribute(OBS_ATTR_PAGE);
                                 mo.disconnect();
                                 // mark as done to avoid repeated waiting
-                                checkedChannels.add('__page__' + username);
+                                processedPages.add(username);
                             }
                         } catch (e) { /* ignore */ }
                     }, 5000);
                 } catch (e) {
                     // fallback: mark as done so we don't loop
-                    checkedChannels.add('__page__' + username);
+                    processedPages.add(username);
                 }
             }
         } catch (e) {
@@ -622,14 +805,13 @@
     // Handle SPA navigation: clear per-page state and re-run processing
     async function onUrlChange() {
         try {
-            // Clear per-page processed set so new cards get processed
-            checkedChannels.clear();
+            // Clear per-page processed set so new pages get processed
+            processedPages.clear();
             // try to refresh token if available locally
             await ensureAccessToken();
             // small delay to let Twitch render new content
             setTimeout(() => {
                 processAllCards();
-                processChannelPage();
             }, 350);
         } catch (e) {
             console.error('onUrlChange error', e);
@@ -666,11 +848,11 @@
 
     const observer = new MutationObserver((mutations) => {
         processAllCards();
-        processChannelPage();
     });
 
     // Start observing
     async function init() {
+        console.warn('TAC: userscript init (should appear once per load)');
         // Try to obtain token (if local server available) before first scan
         try {
             await ensureAccessToken();
@@ -681,7 +863,6 @@
         // small initial delay to allow Twitch to render dynamic cards
         setTimeout(() => {
             processAllCards();
-            processChannelPage();
         }, 350);
 
         // Watch for new content
@@ -691,8 +872,20 @@
             subtree: true
         });
 
+        // Kick extra processing when user hovers sidebar rows (helps popouts/tooltips)
+        let hoverTimer = null;
+        document.addEventListener('mouseover', (e) => {
+            const row = e.target && e.target.closest && e.target.closest('a.side-nav-card__link, .side-nav-card');
+            if (!row) return;
+            if (hoverTimer) clearTimeout(hoverTimer);
+            hoverTimer = setTimeout(() => {
+                processSideNavItem(row);
+                processAllCards(); // catch hover popouts rendered in portals
+            }, 40);
+        }, true);
+
         // Also check periodically in case observer misses something
-        setInterval(processAllCards, 5000);
+        setInterval(() => { dbg('interval sidenav'); processSideNav(); }, 2000);
     }
 
     // Wait for page to be ready
