@@ -648,18 +648,26 @@ console.warn('TAC: bootstrap loaded', new Date().toISOString());
             const username = getPageUsername();
             if (!username) return;
 
-            // Locate the channel header avatar image/container
+            // Locate the channel header avatar image/container - try multiple selectors
             const avatarImg = document.querySelector(
                 '.channel-root__player-container img.tw-image-avatar,\
                  header img.tw-image-avatar,\
                  [data-a-target="home-channel-header"] img.tw-image-avatar,\
-                 .ScAvatar-sc-144b42z-0 img.tw-image-avatar'
+                 .ScAvatar-sc-144b42z-0 img.tw-image-avatar,\
+                 .tw-avatar img.tw-image-avatar,\
+                 img.tw-image-avatar[alt="' + username + '"]'
             ) || document.querySelector('img.tw-image-avatar');
 
-            if (!avatarImg) return;
+            if (!avatarImg) {
+                if (DEBUG) console.log('TAC: no avatar image found for channel header');
+                return;
+            }
 
-            const badgeHost = avatarImg.closest('.tw-avatar') || avatarImg.parentElement;
-            if (!badgeHost) return;
+            const badgeHost = avatarImg.closest('.tw-avatar, .ScAvatar-sc-144b42z-0') || avatarImg.parentElement;
+            if (!badgeHost) {
+                if (DEBUG) console.log('TAC: no badge host found for avatar');
+                return;
+            }
 
             const result = await getBroadcasterInfo(username);
             const broadcasterType = result && result.broadcasterType;
@@ -706,11 +714,18 @@ console.warn('TAC: bootstrap loaded', new Date().toISOString());
         try {
             const username = getPageUsername();
             if (!username) return;
-            // avoid repeating for same username
-            if (processedPages.has(username)) return;
+            // Check if already processing to avoid duplicates, but allow re-processing after content loads
+            // Don't return early - check if label already exists instead
 
-            const titleSelector = 'h1.CoreText-sc-1txzju1-0';
+            // Try multiple selectors for the title element
+            const titleSelector = 'h1.CoreText-sc-1txzju1-0, h1.tw-title, h1.ScTitleText-sc-d9mj2s-0';
             let titleEl = document.querySelector(titleSelector);
+            
+            // If title already has label, skip unless it was removed
+            if (titleEl && titleEl.querySelector('.tac-inline-label')) {
+                if (DEBUG) console.log('TAC: title already has label');
+                return;
+            }
 
             const doAppend = async (el) => {
                 try {
@@ -739,24 +754,21 @@ console.warn('TAC: bootstrap loaded', new Date().toISOString());
                             });
                             mo.observe(parent, { childList: true, subtree: true });
                             pageObservers.set(username, mo);
-                            // auto-disconnect observer after 30s to avoid indefinite watching
+                            // Keep observer active longer to handle late-loading content like tags
                             setTimeout(() => {
                                 try {
                                     const ob = pageObservers.get(username);
                                     if (ob) ob.disconnect();
                                 } catch (e) {}
                                 pageObservers.delete(username);
-                                processedPages.add(username);
-                            }, 30000);
+                            }, 60000); // extended to 60s
                         } catch (e) {
-                            // if observer fails, mark as done so we don't loop forever
-                            processedPages.add(username);
+                            // if observer fails, log but allow retry
+                            if (DEBUG) console.error('TAC: page observer setup failed', e);
                         }
                     }
                 } catch (e) {
                     console.error('processChannelPage append error', e);
-                    // mark as done even on error to avoid spamming
-                    processedPages.add(username);
                 }
             };
 
@@ -786,14 +798,12 @@ console.warn('TAC: bootstrap loaded', new Date().toISOString());
                             if (document.documentElement.getAttribute(OBS_ATTR_PAGE)) {
                                 document.documentElement.removeAttribute(OBS_ATTR_PAGE);
                                 mo.disconnect();
-                                // mark as done to avoid repeated waiting
-                                processedPages.add(username);
                             }
                         } catch (e) { /* ignore */ }
                     }, 5000);
                 } catch (e) {
-                    // fallback: mark as done so we don't loop
-                    processedPages.add(username);
+                    // fallback: log error
+                    if (DEBUG) console.error('TAC: observer setup error', e);
                 }
             }
         } catch (e) {
@@ -812,6 +822,7 @@ console.warn('TAC: bootstrap loaded', new Date().toISOString());
             // small delay to let Twitch render new content
             setTimeout(() => {
                 processAllCards();
+                processChannelPage();
             }, 350);
         } catch (e) {
             console.error('onUrlChange error', e);
@@ -848,6 +859,7 @@ console.warn('TAC: bootstrap loaded', new Date().toISOString());
 
     const observer = new MutationObserver((mutations) => {
         processAllCards();
+        processChannelPage(); // also reprocess channel page title when content changes
     });
 
     // Start observing
@@ -863,6 +875,7 @@ console.warn('TAC: bootstrap loaded', new Date().toISOString());
         // small initial delay to allow Twitch to render dynamic cards
         setTimeout(() => {
             processAllCards();
+            processChannelPage();
         }, 350);
 
         // Watch for new content
