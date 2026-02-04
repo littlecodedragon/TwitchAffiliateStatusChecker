@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Twitch Affiliate Status Checker
 // @namespace    https://github.com/littlecodedragon//TwitchAffiliateStatusChecker
-// @version      1.1
+// @version      1.2
 // @description  Shows affiliate/partner status on Twitch directory and browse pages
 // @author       You
 // @match        https://www.twitch.tv/directory/*
@@ -35,6 +35,11 @@ console.warn('TAC: bootstrap loaded', new Date().toISOString());
     // Track which channel pages already have inline labels
     const processedPages = new Set();
     const channelCache = new Map();
+    const errorCache = new Map(); // short-lived cache for failures to avoid request thrash
+    const pendingLookups = new Map(); // username -> [resolvers]
+    const pendingQueue = [];
+    let batchTimer = null;
+    let batchInFlight = false;
     const pageObservers = new Map();
     let invalidToken = false; // set to true when API returns 401 to prevent repeated requests
     const DEBUG = false; // set false for release; true enables debug logs
@@ -52,6 +57,9 @@ console.warn('TAC: bootstrap loaded', new Date().toISOString());
     const TOKEN_RETRY_MS = 10000;
     let rateLimitUntil = 0;
     const RATE_LIMIT_BACKOFF_MS = 60 * 1000; // 1 minute backoff on 429
+    const BATCH_MAX = 50; // Twitch Helix /users supports up to 100 logins; keep below to avoid long URLs
+    const BATCH_DELAY_MS = 500; // debounce to batch multiple usernames
+    const ERROR_TTL_MS = 20000; // cache errors briefly to prevent repeated retries
 
     // Track last location to detect SPA navigation changes
     let lastHref = location.href;
@@ -75,6 +83,7 @@ console.warn('TAC: bootstrap loaded', new Date().toISOString());
                             invalidToken = false;
                             // reset caches so we re-query with the new token
                                 channelCache.clear();
+                                errorCache.clear();
                                 processedPages.clear();
                                 // remove any old badges that were created before we had a token
                                 removeAllBadges();
@@ -98,98 +107,175 @@ console.warn('TAC: bootstrap loaded', new Date().toISOString());
         });
     }
 
+    function normalizeUsername(name) {
+        if (!name) return '';
+        return String(name).trim().replace(/^@/, '').toLowerCase();
+    }
+
+    function getCachedError(login) {
+        const cached = errorCache.get(login);
+        if (!cached) return null;
+        if (cached.expiresAt && cached.expiresAt < Date.now()) {
+            errorCache.delete(login);
+            return null;
+        }
+        return cached.result || null;
+    }
+
+    function setCachedError(login, result, ttlMs) {
+        errorCache.set(login, { result, expiresAt: Date.now() + ttlMs });
+    }
+
+    function resolvePending(login, result, cacheSuccess, errorTtlMs) {
+        const resolvers = pendingLookups.get(login) || [];
+        pendingLookups.delete(login);
+        if (cacheSuccess) {
+            channelCache.set(login, result);
+            errorCache.delete(login);
+        } else if (errorTtlMs) {
+            setCachedError(login, result, errorTtlMs);
+        }
+        for (const r of resolvers) {
+            try { r(result); } catch (e) {}
+        }
+    }
+
+    function scheduleBatch(delayMs = BATCH_DELAY_MS) {
+        if (batchTimer || batchInFlight) return;
+        batchTimer = setTimeout(() => {
+            batchTimer = null;
+            runBatch();
+        }, delayMs);
+    }
+
+    async function runBatch() {
+        if (batchInFlight) return;
+        if (pendingQueue.length === 0) return;
+
+        const now = Date.now();
+        if (now < rateLimitUntil) {
+            scheduleBatch(Math.max(200, rateLimitUntil - now));
+            return;
+        }
+
+        batchInFlight = true;
+        const batch = pendingQueue.splice(0, BATCH_MAX);
+
+        const finish = () => {
+            batchInFlight = false;
+            if (pendingQueue.length > 0) {
+                scheduleBatch(BATCH_DELAY_MS);
+            }
+        };
+
+        // try to ensure we have a token (try local server, but retry periodically)
+        if (!OAUTH_TOKEN && (now - lastTokenAttempt > TOKEN_RETRY_MS)) {
+            lastTokenAttempt = now;
+            await ensureAccessToken();
+        }
+
+        const resolveBatchError = (result, ttlMs) => {
+            for (const login of batch) {
+                resolvePending(login, result, false, ttlMs || ERROR_TTL_MS);
+            }
+            finish();
+        };
+
+        const sendRequest = (retry) => {
+            const qs = batch.map((login) => `login=${encodeURIComponent(login)}`).join('&');
+            GM_xmlhttpRequest({
+                method: 'GET',
+                url: `https://api.twitch.tv/helix/users?${qs}`,
+                headers: {
+                    'Client-ID': CLIENT_ID,
+                    'Authorization': `Bearer ${OAUTH_TOKEN}`
+                },
+                onload: async function(response) {
+                    const status = response.status;
+                    if (status === 200) {
+                        try {
+                            const data = JSON.parse(response.responseText);
+                            const byLogin = new Map();
+                            if (data && data.data && Array.isArray(data.data)) {
+                                for (const u of data.data) {
+                                    const login = normalizeUsername(u.login || u.display_name || '');
+                                    if (login) {
+                                        byLogin.set(login, u.broadcaster_type || '');
+                                    }
+                                }
+                            }
+                            for (const login of batch) {
+                                const broadcasterType = byLogin.has(login) ? byLogin.get(login) : '';
+                                const result = { broadcasterType, error: null };
+                                resolvePending(login, result, true);
+                            }
+                            return finish();
+                        } catch (e) {
+                            console.error('Error parsing Twitch API response for batch', e);
+                            return resolveBatchError({ broadcasterType: '', error: 'parse_error' }, ERROR_TTL_MS);
+                        }
+                    }
+
+                    // Handle 401 by attempting to refresh token once
+                    if (status === 401 && !retry) {
+                        console.warn('Twitch API 401 for batch - attempting token refresh');
+                        await ensureAccessToken();
+                        if (OAUTH_TOKEN) {
+                            return sendRequest(true);
+                        }
+                    }
+
+                    // Handle 429 rate limiting by backing off
+                    if (status === 429) {
+                        console.warn('Twitch API 429 (rate limited). Backing off for', RATE_LIMIT_BACKOFF_MS, 'ms');
+                        rateLimitUntil = Date.now() + RATE_LIMIT_BACKOFF_MS;
+                        return resolveBatchError({ broadcasterType: '', error: 'rate_limited' }, RATE_LIMIT_BACKOFF_MS);
+                    }
+
+                    const err = `HTTP ${status}`;
+                    console.error('Twitch API error for batch', err, response.responseText);
+                    if (status === 401) {
+                        invalidToken = true;
+                        console.warn('Twitch Affiliate: invalid or missing OAuth token');
+                    }
+                    return resolveBatchError({ broadcasterType: '', error: err }, ERROR_TTL_MS);
+                },
+                onerror: function(error) {
+                    console.error('API request failed for batch', error);
+                    return resolveBatchError({ broadcasterType: '', error: 'network_error' }, ERROR_TTL_MS);
+                }
+            });
+        };
+
+        // If we still don't have a token, attempt the request (Twitch will respond accordingly)
+        sendRequest(false);
+    }
+
     // Get broadcaster info from Twitch API (returns { broadcasterType, error })
     async function getBroadcasterInfo(username) {
+        const login = normalizeUsername(username);
+        if (!login) return { broadcasterType: '', error: 'invalid_username' };
+
+        const cachedErr = getCachedError(login);
+        if (cachedErr) return cachedErr;
+
         // normalize cached values: if cache stored a raw string, convert to object
-        if (channelCache.has(username)) {
-            const cached = channelCache.get(username);
+        if (channelCache.has(login)) {
+            const cached = channelCache.get(login);
             if (cached && typeof cached === 'string') {
                 return { broadcasterType: cached, error: null };
             }
             return cached;
         }
 
-        return new Promise(async (resolve) => {
-            // try to ensure we have a token (try local server, but retry periodically)
-            const now = Date.now();
-            if (!OAUTH_TOKEN && (now - lastTokenAttempt > TOKEN_RETRY_MS)) {
-                lastTokenAttempt = now;
-                await ensureAccessToken();
+        return new Promise((resolve) => {
+            if (pendingLookups.has(login)) {
+                pendingLookups.get(login).push(resolve);
+                return;
             }
-
-            // internal request function with single-retry-on-401
-            const sendRequest = (retry) => {
-                GM_xmlhttpRequest({
-                    method: 'GET',
-                    url: `https://api.twitch.tv/helix/users?login=${encodeURIComponent(username)}`,
-                    headers: {
-                        'Client-ID': CLIENT_ID,
-                        'Authorization': `Bearer ${OAUTH_TOKEN}`
-                    },
-                    onload: async function(response) {
-                        const status = response.status;
-                        if (status === 200) {
-                            try {
-                                const data = JSON.parse(response.responseText);
-                                if (data.data && data.data.length > 0) {
-                                    const broadcasterType = data.data[0].broadcaster_type || '';
-                                    const result = { broadcasterType, error: null };
-                                    channelCache.set(username, result);
-                                    return resolve(result);
-                                }
-                                const result = { broadcasterType: '', error: null };
-                                channelCache.set(username, result);
-                                return resolve(result);
-                            } catch (e) {
-                                console.error('Error parsing Twitch API response for', username, e);
-                                const result = { broadcasterType: '', error: 'parse_error' };
-                                // do not cache parse errors; allow retry
-                                return resolve(result);
-                            }
-                        }
-
-                        // Handle 401 by attempting to refresh token once
-                        if (status === 401 && !retry) {
-                            console.warn('Twitch API 401 for', username, '- attempting token refresh');
-                            await ensureAccessToken();
-                            if (OAUTH_TOKEN) {
-                                // retry once with new token
-                                return sendRequest(true);
-                            }
-                        }
-
-                                    // Handle 429 rate limiting by backing off
-                                    if (status === 429) {
-                                        console.warn('Twitch API 429 (rate limited). Backing off for', RATE_LIMIT_BACKOFF_MS, 'ms');
-                                        rateLimitUntil = Date.now() + RATE_LIMIT_BACKOFF_MS;
-                                    }
-
-                        const err = `HTTP ${status}`;
-                        console.error('Twitch API error for', username, err, response.responseText);
-                        if (status === 401) {
-                            invalidToken = true;
-                            console.warn('Twitch Affiliate: invalid or missing OAuth token');
-                        }
-                        // do not cache failing responses so we can retry after token/limits clear
-                        return resolve({ broadcasterType: '', error: err });
-                    },
-                    onerror: function(error) {
-                        console.error('API request failed for', username, error);
-                        // do not cache network failures
-                        return resolve({ broadcasterType: '', error: 'network_error' });
-                    }
-                });
-            };
-
-            // If rate-limited, avoid making requests
-            if (Date.now() < rateLimitUntil) {
-                const result = { broadcasterType: '', error: 'rate_limited' };
-                return resolve(result);
-            }
-
-            // If we still don't have a token, just attempt the request (Twitch will respond accordingly)
-
-            sendRequest(false);
+            pendingLookups.set(login, [resolve]);
+            pendingQueue.push(login);
+            scheduleBatch();
         });
     }
 
